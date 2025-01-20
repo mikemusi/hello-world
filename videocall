@@ -1,0 +1,386 @@
+// server.js
+const express = require('express');
+const https = require('https');
+const WebSocket = require('ws');
+const fs = require('fs');
+
+const app = express();
+
+// Serve static files
+app.use(express.static('public'));
+
+// Generate a simple room code
+app.get('/create-room', (req, res) => {
+  const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+  res.json({ roomCode });
+});
+
+// SSL configuration (you'll need real certificates in production)
+const serverConfig = {
+  cert: fs.readFileSync('path/to/cert.pem'),
+  key: fs.readFileSync('path/to/key.pem')
+};
+
+const server = https.createServer(serverConfig, app);
+const wss = new WebSocket.Server({ server });
+
+// Store rooms and their participants
+const rooms = new Map();
+
+wss.on('connection', (ws) => {
+  let roomCode = '';
+  let userId = '';
+
+  ws.on('message', (message) => {
+    const data = JSON.parse(message);
+
+    switch (data.type) {
+      case 'join':
+        roomCode = data.roomCode;
+        userId = Math.random().toString(36).substring(2, 10);
+        
+        if (!rooms.has(roomCode)) {
+          rooms.set(roomCode, new Map());
+        }
+        
+        const room = rooms.get(roomCode);
+        room.set(userId, ws);
+        
+        ws.send(JSON.stringify({
+          type: 'joined',
+          userId,
+          isFirst: room.size === 1
+        }));
+        break;
+
+      case 'offer':
+      case 'answer':
+      case 'iceCandidate':
+        const room = rooms.get(roomCode);
+        room.forEach((client, id) => {
+          if (id !== userId) {
+            client.send(JSON.stringify({
+              type: data.type,
+              data: data.data,
+              from: userId
+            }));
+          }
+        });
+        break;
+    }
+  });
+
+  ws.on('close', () => {
+    if (roomCode && rooms.has(roomCode)) {
+      const room = rooms.get(roomCode);
+      room.delete(userId);
+      if (room.size === 0) {
+        rooms.delete(roomCode);
+      } else {
+        room.forEach((client) => {
+          client.send(JSON.stringify({
+            type: 'peerLeft',
+            userId
+          }));
+        });
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 443;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// public/index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mobile Video Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, system-ui, BlinkMacSystemFont;
+        }
+        .container {
+            max-width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .video-container {
+            flex: 1;
+            position: relative;
+            background: #000;
+        }
+        #remoteVideo {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        #localVideo {
+            position: absolute;
+            width: 30%;
+            max-height: 25%;
+            object-fit: cover;
+            top: 20px;
+            right: 20px;
+            border-radius: 12px;
+            border: 2px solid white;
+        }
+        .controls {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 20px;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+        .room-join {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            padding: 20px;
+        }
+        button {
+            padding: 12px 24px;
+            border-radius: 24px;
+            border: none;
+            background: #007AFF;
+            color: white;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        button:disabled {
+            background: #999;
+        }
+        input {
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #ccc;
+            font-size: 16px;
+            text-transform: uppercase;
+            text-align: center;
+            width: 200px;
+        }
+        .control-button {
+            width: 60px;
+            height: 60px;
+            border-radius: 30px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .end-call {
+            background: #FF3B30;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="video-container">
+            <video id="remoteVideo" autoplay playsinline></video>
+            <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+        <div class="controls">
+            <button class="control-button" id="toggleVideo">📹</button>
+            <button class="control-button" id="toggleAudio">🎤</button>
+            <button class="control-button end-call" id="endCall">📞</button>
+        </div>
+        <div class="room-join" id="joinScreen">
+            <h2>Video Chat</h2>
+            <button id="createRoom">Create New Room</button>
+            <div>- or -</div>
+            <input type="text" id="roomInput" placeholder="Enter room code" maxlength="6">
+            <button id="joinRoom">Join Room</button>
+        </div>
+    </div>
+    <script src="client.js"></script>
+</body>
+</html>
+
+// public/client.js
+let localStream;
+let peerConnection;
+let ws;
+let roomCode;
+
+const configuration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    // Add TURN server configuration here
+  ],
+};
+
+async function init() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user' },
+      audio: true
+    });
+    document.getElementById('localVideo').srcObject = localStream;
+  } catch (e) {
+    console.error('Error accessing media devices:', e);
+    alert('Unable to access camera or microphone');
+  }
+}
+
+async function createRoom() {
+  const response = await fetch('/create-room');
+  const data = await response.json();
+  roomCode = data.roomCode;
+  alert(`Your room code is: ${roomCode}`);
+  joinRoom(roomCode);
+}
+
+function joinRoom(code) {
+  roomCode = code.toUpperCase();
+  ws = new WebSocket(`wss://${location.host}`);
+  
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: 'join',
+      roomCode
+    }));
+  };
+  
+  ws.onmessage = async (event) => {
+    const message = JSON.parse(event.data);
+    
+    switch (message.type) {
+      case 'joined':
+        document.getElementById('joinScreen').style.display = 'none';
+        if (message.isFirst) {
+          await init();
+        } else {
+          await init();
+          createPeerConnection();
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          ws.send(JSON.stringify({
+            type: 'offer',
+            data: offer
+          }));
+        }
+        break;
+        
+      case 'offer':
+        await handleOffer(message.data);
+        break;
+        
+      case 'answer':
+        await handleAnswer(message.data);
+        break;
+        
+      case 'iceCandidate':
+        await handleIceCandidate(message.data);
+        break;
+        
+      case 'peerLeft':
+        handlePeerLeft();
+        break;
+    }
+  };
+}
+
+function createPeerConnection() {
+  peerConnection = new RTCPeerConnection(configuration);
+  
+  peerConnection.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({
+        type: 'iceCandidate',
+        data: event.candidate
+      }));
+    }
+  };
+  
+  peerConnection.ontrack = (event) => {
+    document.getElementById('remoteVideo').srcObject = event.streams[0];
+  };
+  
+  localStream.getTracks().forEach(track => {
+    peerConnection.addTrack(track, localStream);
+  });
+}
+
+async function handleOffer(offer) {
+  createPeerConnection();
+  await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+  const answer = await peerConnection.createAnswer();
+  await peerConnection.setLocalDescription(answer);
+  ws.send(JSON.stringify({
+    type: 'answer',
+    data: answer
+  }));
+}
+
+async function handleAnswer(answer) {
+  await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+}
+
+async function handleIceCandidate(candidate) {
+  try {
+    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (e) {
+    console.error('Error adding ICE candidate:', e);
+  }
+}
+
+function handlePeerLeft() {
+  document.getElementById('remoteVideo').srcObject = null;
+  if (peerConnection) {
+    peerConnection.close();
+    peerConnection = null;
+  }
+}
+
+function toggleVideo() {
+  const videoTrack = localStream.getVideoTracks()[0];
+  videoTrack.enabled = !videoTrack.enabled;
+  document.getElementById('toggleVideo').textContent = videoTrack.enabled ? '📹' : '❌';
+}
+
+function toggleAudio() {
+  const audioTrack = localStream.getAudioTracks()[0];
+  audioTrack.enabled = !audioTrack.enabled;
+  document.getElementById('toggleAudio').textContent = audioTrack.enabled ? '🎤' : '🔇';
+}
+
+function endCall() {
+  if (peerConnection) {
+    peerConnection.close();
+    peerConnection = null;
+  }
+  if (ws) {
+    ws.close();
+  }
+  document.getElementById('joinScreen').style.display = 'flex';
+  document.getElementById('remoteVideo').srcObject = null;
+}
+
+document.getElementById('createRoom').addEventListener('click', createRoom);
+document.getElementById('joinRoom').addEventListener('click', () => {
+  const code = document.getElementById('roomInput').value;
+  if (code.length === 6) {
+    joinRoom(code);
+  }
+});
+document.getElementById('toggleVideo').addEventListener('click', toggleVideo);
+document.getElementById('toggleAudio').addEventListener('click', toggleAudio);
+document.getElementById('endCall').addEventListener('click', endCall);
